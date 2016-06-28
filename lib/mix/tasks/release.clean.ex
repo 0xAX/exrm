@@ -14,9 +14,10 @@ defmodule Mix.Tasks.Release.Clean do
       mix release.clean --implode --no-confirm
 
   """
-  @shortdoc "Clean up any release-related files."
+  @shortdoc "Clean up any release-related files"
 
   use     Mix.Task
+  alias   ReleaseManager.Utils.Logger
   import  ReleaseManager.Utils
 
   def run(args) do
@@ -33,27 +34,26 @@ defmodule Mix.Tasks.Release.Clean do
   def do_run(args) do
     app     = Mix.Project.config |> Keyword.get(:app)
     version = Mix.Project.config |> Keyword.get(:version)
-    debug "Removing release files for #{app}-#{version}..."
+    Logger.debug "Removing release files for #{app}-#{version}..."
     cond do
       "--implode" in args ->
         if "--no-confirm" in args or confirm_implode?(app) do
           do_cleanup :all
           execute_after_hooks(args)
-          info "All release files for #{app}-#{version} were removed successfully!"
+          Logger.info "All release files for #{app}-#{version} were removed successfully!"
         end
       true ->
         do_cleanup :build
         execute_after_hooks(args)
-        info "The release for #{app}-#{version} has been removed."
+        Logger.info "The release for #{app}-#{version} has been removed."
     end
   end
 
   # Clean release build
   def do_cleanup(:build) do
-    cwd       = File.cwd!
     project   = Mix.Project.config |> Keyword.get(:app) |> Atom.to_string
     version   = Mix.Project.config |> Keyword.get(:version)
-    build     = Path.join([cwd, "_build", "prod"])
+    build     = Path.absname("../prod", Mix.Project.build_path)
     release   = rel_dest_path [project, "releases", version]
     releases  = rel_dest_path [project, "releases", "RELEASES"]
     start_erl = rel_dest_path [project, "releases", "start_erl.data"]
@@ -95,7 +95,7 @@ defmodule Mix.Tasks.Release.Clean do
       rescue
         exception ->
           stacktrace = System.stacktrace
-          error "Failed to execute after_cleanup hook for #{plugin}!"
+          Logger.error "Failed to execute after_cleanup hook for #{plugin}!"
           reraise exception, stacktrace
       end
     end
@@ -103,12 +103,13 @@ defmodule Mix.Tasks.Release.Clean do
 
   defp confirm_implode?(app) do
     IO.puts IO.ANSI.yellow
-    confirmed? = Mix.Shell.IO.yes?("""
-      THIS WILL REMOVE ALL RELEASES AND RELATED CONFIGURATION FOR #{app |> Atom.to_string |> String.upcase}!
-      Are you absolutely sure you want to proceed?
-      """)
+    msg = """
+    THIS WILL REMOVE ALL RELEASES AND RELATED CONFIGURATION FOR #{app |> Atom.to_string |> String.upcase}!
+    Are you absolutely sure you want to proceed?
+    """
+    answer = IO.gets(msg <> " [Yn]: ") |> String.rstrip(?\n)
     IO.puts IO.ANSI.reset
-    confirmed?
+    answer =~ ~r/^(Y(es)?)?$/i
   end
 
 end

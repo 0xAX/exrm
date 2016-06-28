@@ -4,6 +4,7 @@ defmodule ReleaseManager.Utils do
   `mix release.clean` tasks.
   """
   import Mix.Shell,    only: [cmd: 2]
+  alias ReleaseManager.Utils.Logger
 
   # Relx constants
   @relx_output_path      "rel"
@@ -26,10 +27,11 @@ defmodule ReleaseManager.Utils do
   @doc """
   Load the current project's configuration
   """
-  def load_config(env) do
+  def load_config(env, project_config \\ Mix.Project.config) do
+    config_path = Keyword.get(project_config, :config_path, "config/config.exs")
     with_env env, fn ->
-      if File.regular?("config/config.exs") do
-        Mix.Config.read! "config/config.exs"
+      if File.regular?(config_path) do
+        Mix.Config.read! config_path
       else
         []
       end
@@ -104,20 +106,51 @@ defmodule ReleaseManager.Utils do
     end
     case result do
       {:ok, _state} -> :ok
-      {:error, _e}  -> {:error, "Failed to build release. Please fix any errors and try again."}
+      {:error, e} ->
+        case e do
+          {:rlx_prv_release, :no_goals_specified} ->
+            {:error, "No goals have been specified for this release!"}
+          {:rlx_prv_release, {:release_erts_error, dir}} ->
+            {:error, "ERTS could not be found in #{dir}"}
+          {:rlx_prv_release, {:no_release_name, vsn}} ->
+            {:error, "A target release version was specified (#{vsn}) but no name."}
+          {:rlx_prv_release, {:invalid_release_info, info}} ->
+            {:error, "Target release information is in an invalid format:\n#{inspect info}"}
+          {:rlx_prv_release, {:multiple_release_names, a, b}} ->
+            {:error, "Multiple releasees are defined, but no default was specified: #{a}, #{b}"}
+          {:rlx_prv_release, :no_releases_in_system} ->
+            {:error, "No releases have been defined! See the debug output for more information."}
+          {:rlx_prv_release, {:no_releases_for, name}} ->
+            {:error, "No releaases exist for #{name}. See the debug output for more information."}
+          {:rlx_prv_release, {:release_not_found, {name, vsn}}} ->
+            {:error, "No such releaase: #{name}-#{vsn}. See the debug output for more information."}
+          {:rlx_prv_release, {:failed_solve, {:unreachable_package, missing_app}}} ->
+            {:error, "Unable to find application #{missing_app}. See the debug output for more information."}
+          {:rlx_prv_relup, {:relup_generation_error, current_name, upfrom_name}}->
+            {:error, "Unknown internal release error generating the relup from #{upfrom_name} to #{current_name}. See debug output."}
+          {:rlx_prv_relup, {:relup_generation_warning, module, warnings}}->
+            {:error, "Warnings generating relup:\n#{:rlx_util.indent(2)}#{module.format_warning(warnings)}"}
+          {:rlx_prv_relup, {:no_upfrom_release_found, :undefined}} ->
+            {:error, "Could not find any previous versions of the release to upgrade!"}
+          {:rlx_prv_relup, {:no_upfrom_release_found, vsn}} ->
+            {:error, "Could not find find release version #{vsn} for relup!"}
+          {:rlx_prv_relup, {:relup_script_generation_error, {:relup_script_generator_error, :systools_relup, {:missing_sasl, _}}}} ->
+            {:error, "Unfortunately, due to requirements in systools, you need to have the sasl application \n  in both current release and the release to upgrade from."}
+          {:rlx_prv_relup, {:relup_script_generation_error, module, errors}}->
+            {:error, "Failed to generate relup: #{:rlx_util.indent(2)}#{module.format_error(errors)}"}
+          {:rlx_prv_archive, {:tar_unknown_generation_error, module, vsn}}->
+            {:error, "Unknown error occurred when generating tarball for #{module}-#{vsn}\n  Do you have any file names longer than 100 characters? That is a known issue with systools."}
+          {:rlx_prv_archive, {:tar_generation_warn, module, warnings}}->
+            {:error, "Warnings were reported when generating the release tarball:\n#{:rlx_util.indent(2)}#{module}: #{inspect warnings}"}
+          {:rlx_prv_archive, {:tar_generation_error, module, errors}}->
+            {:error, "Errors occurred when generating the release tarball:\n#{:rlx_util.indent(2)}#{module}: #{inspect errors}"}
+          {:rlx_app_info, {:vsn_parse, app}}->
+            {:error, "Could not parse version for #{app}"}
+          {_relx_module, _unhandled_err} ->
+            {:error, "Failed to build release. See the debug output for specifics."}
+        end
     end
   end
-
-  @doc "Print an informational message without color"
-  def debug(message), do: IO.puts "==> #{message}"
-  @doc "Print an informational message in green"
-  def info(message),  do: IO.puts "==> #{IO.ANSI.green}#{message}#{IO.ANSI.reset}"
-  @doc "Print a warning message in yellow"
-  def warn(message),  do: IO.puts "==> #{IO.ANSI.yellow}#{message}#{IO.ANSI.reset}"
-  @doc "Print a notice in yellow"
-  def notice(message), do: IO.puts "#{IO.ANSI.yellow}#{message}#{IO.ANSI.reset}"
-  @doc "Print an error message in red"
-  def error(message), do: IO.puts "==> #{IO.ANSI.red}#{message}#{IO.ANSI.reset}"
 
   @doc "Exits with exit status 1"
   def abort!, do: exit({:shutdown, 1})
@@ -154,18 +187,38 @@ defmodule ReleaseManager.Utils do
   compare, but can fall back to regular string compare.
   """
   def sort_versions(versions) do
-    versions |> Enum.sort(
-      fn v1, v2 ->
-        case { parse_version(v1), parse_version(v2) } do
+    versions
+    |> Enum.map(fn ver ->
+        # Special handling for git-describe versions
+        compared = case Regex.named_captures(~r/(?<ver>\d+\.\d+\.\d+)-(?<commits>\d+)-(?<sha>[A-Ga-g0-9]+)/, ver) do
+          nil ->
+            {:standard, ver, nil}
+          %{"ver" => version, "commits" => n, "sha" => sha} ->
+            {:describe, <<version::binary, ?+, n::binary, ?-, sha::binary>>, String.to_integer(n)}
+        end
+        {ver, compared}
+      end)
+    |> Enum.sort(
+      fn {_, {v1type, v1str, v1_commits_since}}, {_, {v2type, v2str, v2_commits_since}} ->
+        case { parse_version(v1str), parse_version(v2str) } do
           {{:semantic, v1}, {:semantic, v2}} ->
             case Version.compare(v1, v2) do
               :gt -> true
-              _   -> false
+              :eq ->
+                case {v1type, v2type} do
+                  {:standard, :standard} -> v1 > v2 # probably always false
+                  {:standard, :describe} -> false   # v2 is an incremental version over v1
+                  {:describe, :standard} -> true    # v1 is an incremental version over v2
+                  {:describe, :describe} ->         # need to parse out the bits
+                    v1_commits_since > v2_commits_since
+                end
+              :lt -> false
             end;
           {{_, v1}, {_, v2}} ->
             v1 >  v2
         end
       end)
+    |> Enum.map(fn {v, _} -> v end)
   end
 
   defp parse_version(ver) do
@@ -209,10 +262,10 @@ defmodule ReleaseManager.Utils do
       {:ok, terms} ->
         terms
       {:error, {line, type, msg}} ->
-        error "Unable to parse #{path}: Line #{line}, #{type}, - #{msg}"
+        Logger.error "Unable to parse #{path}: Line #{line}, #{type}, - #{msg}"
         abort!
       {:error, reason} ->
-        error "Unable to access #{path}: #{reason}"
+        Logger.error "Unable to access #{path}: #{reason}"
         abort!
     end
     result
@@ -308,20 +361,20 @@ defmodule ReleaseManager.Utils do
   @doc "Get the rel path of the current project."
   def rel_dest_path,                            do: Path.join(File.cwd!, "rel")
   @doc """
-  Get the path to a file located in the rel/files directory of the current project.
+  Get the path to a file located in the rel/.files directory of the current project.
   You can pass either a file name, or a list of directories to a file, like:
 
       iex> ReleaseManager.Utils.rel_file_dest_path "sys.config"
-      "path/to/project/rel/files/sys.config"
+      "path/to/project/rel/.files/sys.config"
 
       iex> ReleaseManager.Utils.rel_dest_path ["some", "path", "file.txt"]
-      "path/to/project/rel/files/some/path/file.txt"
+      "path/to/project/rel/.files/some/path/file.txt"
 
   """
   def rel_file_dest_path(files) when is_list(files), do: Path.join([rel_file_dest_path] ++ files)
   def rel_file_dest_path(file),                      do: Path.join(rel_file_dest_path, file)
-  @doc "Get the rel/files path of the current project."
-  def rel_file_dest_path,                            do: Path.join([File.cwd!, "rel", "files"])
+  @doc "Get the rel/.files path of the current project."
+  def rel_file_dest_path,                            do: Path.join([File.cwd!, "rel", ".files"])
 
   # Ignore a message when used as the callback for Mix.Shell.cmd
   defp ignore(_), do: nil

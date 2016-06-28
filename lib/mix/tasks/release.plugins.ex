@@ -14,6 +14,7 @@ defmodule Mix.Tasks.Release.Plugins do
   @shortdoc "View information about active release plugins"
 
   use    Mix.Task
+  alias  ReleaseManager.Utils.Logger
   import ReleaseManager.Utils
 
   def run(args) do
@@ -21,11 +22,14 @@ defmodule Mix.Tasks.Release.Plugins do
   end
 
   defp do_run([action: :list]) do
-    plugins = get_plugins
-    for plugin <- plugins do
-      name     = get_name(plugin)
-      shortdoc = get_shortdoc(plugin)
-      IO.puts String.ljust(name, 30) <> " # " <> shortdoc
+    case get_plugins do
+      []      -> IO.puts "No plugins found!"
+      plugins ->
+        for plugin <- plugins do
+          name     = get_name(plugin)
+          shortdoc = get_shortdoc(plugin)
+          IO.puts String.ljust(name, 30) <> " # " <> shortdoc
+        end
     end
   end
   defp do_run([action: :details, plugin: plugin]) do
@@ -47,7 +51,7 @@ defmodule Mix.Tasks.Release.Plugins do
     end)
     case result do
       nil ->
-        notice "No plugin by that name could be found!"
+        Logger.notice "No plugin by that name could be found!"
         abort!
       _ ->
         result
@@ -86,7 +90,7 @@ defmodule Mix.Tasks.Release.Plugins do
       {_, [], _} -> [action: :list]
       {_, [plugin], _} -> [action: :details, plugin: plugin]
       {_, _, _} ->
-        error "Invalid arguments for `mix release.plugins`!"
+        Logger.error "Invalid arguments for `mix release.plugins`!"
         abort!
     end
   end

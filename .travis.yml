@@ -2,10 +2,14 @@ sudo: false
 language: elixir
 elixir:
   - 1.1.0
+  - 1.2.0
 otp_release:
-  - 18.0
+  - 18.1
 env:
   - MIX_ENV=test
 script:
-  - mix test --exclude expensive --cover
-  - mix test --only expensive --cover
+  - mix test --exclude expensive
+  - mix test --only expensive
+notifications:
+  email:
+    - paulschoenfelder@gmail.com

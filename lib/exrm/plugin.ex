@@ -50,17 +50,18 @@ defmodule ReleaseManager.Plugin do
   both of which receive a %ReleaseManager.Config struct, as well as `after_cleanup/1`, which
   receives the arguments given for the command as a list of strings.
   """
-  defcallback before_release(ReleaseManager.Config.t) :: any
-  defcallback after_release(ReleaseManager.Config.t) :: any
-  defcallback after_package(ReleaseManager.Config.t) :: any
-  defcallback after_cleanup([String.t]) :: any
+  @callback before_release(ReleaseManager.Config.t) :: any
+  @callback after_release(ReleaseManager.Config.t) :: any
+  @callback after_package(ReleaseManager.Config.t) :: any
+  @callback after_cleanup([String.t]) :: any
 
   @doc false
   defmacro __using__(_opts) do
     quote do
       @behaviour ReleaseManager.Plugin
       alias  ReleaseManager.Config
-      import ReleaseManager.Utils, only: [debug: 1, info: 1, warn: 1, notice: 1, error: 1]
+      alias  ReleaseManager.Utils.Logger
+      import Logger, only: [debug: 1, info: 1, warn: 1, notice: 1, error: 1]
 
       Module.register_attribute __MODULE__, :name, accumulate: false, persist: true
       Module.register_attribute __MODULE__, :moduledoc, accumulate: false, persist: true
@@ -88,24 +89,23 @@ defmodule ReleaseManager.Plugin do
   end
 
   defp available_modules(plugin_type) do
-    apps_path = Mix.Project.build_path |> Path.join("lib")
-    apps      = case apps_path |> File.ls do
-      {:ok, apps} -> apps
-      {:error, _} -> []
-    end
-    apps
-    |> Stream.map(&(Path.join([apps_path, &1, "ebin"])))
-    |> Stream.filter(&File.exists?/1)
-    |> Stream.map(fn app_path -> app_path |> File.ls! |> Enum.map(&(Path.join(app_path, &1))) end)
-    |> Stream.flat_map(&(&1))
-    |> Stream.filter(&(String.ends_with?(&1, ".beam")))
+    # Ensure the current projects code path is loaded
+    Mix.Task.run("loadpaths", [])
+    # Fetch all .beam files
+    Path.wildcard(Path.join([Mix.Project.build_path, "lib/**/ebin/**/*.beam"]))
+    |> Stream.map(&String.to_char_list/1)
+    # Parse the BEAM for behaviour implementations
     |> Stream.map(fn path ->
-      {:ok, {module, chunks}} = :beam_lib.chunks('#{path}', [:attributes])
-      {module, get_in(chunks, [:attributes, :behaviour])}
+      case :beam_lib.chunks(path, [:attributes]) do
+        {:ok, {mod, chunks}}  ->
+          {mod, get_in(chunks, [:attributes, :behaviour])}
+        _ ->
+          :error
+      end
     end)
-    |> Stream.filter(fn {_module, behaviours} ->
-      is_list(behaviours) && plugin_type in behaviours
-    end)
+    # Filter out behaviours we don't care about and duplicates
+    |> Stream.filter(fn :error -> false; {_mod, behaviours} -> is_list(behaviours) && plugin_type in behaviours end)
+    |> Enum.uniq
     |> Enum.map(fn {module, _} -> module end)
   end
 end

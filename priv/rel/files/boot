@@ -64,7 +64,9 @@
 # editable `/etc/HelloWorld.conf` configuration or to revert configuration changes.
 #
 
-set -e
+if [ -n "${EXRM_INIT_TRACE}" ]; then
+    set -x
+fi
 
 SCRIPT_DIR="$(dirname "$0")"
 RELEASE_ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -74,7 +76,7 @@ REL_VSN=$(cat $RELEASES_DIR/start_erl.data | cut -d' ' -f2)
 ERTS_VSN=$(cat $RELEASES_DIR/start_erl.data | cut -d' ' -f1)
 REL_DIR="$RELEASES_DIR/$REL_VSN"
 REL_LIB_DIR="$RELEASE_ROOT_DIR/lib"
-ERL_OPTS="{{{ERL_OPTS}}}"
+ERL_OPTS="{{{ERL_OPTS}}} ${ERL_OPTS}"
 CONFORM_OPTS=""
 PIPE_DIR="$RELEASE_ROOT_DIR/tmp/erl_pipes/{{{PROJECT_NAME}}}/"
 ERTS_DIR=""
@@ -125,7 +127,7 @@ relx_rem_sh() {
 
     # Setup Elixir remote shell command to control node
     exec "$BINDIR/erl" \
-        -pa "$ROOTDIR"/lib/*/ebin "$ROOTDIR"/lib/consolidated \
+        -pa "$ROOTDIR"/lib/*/ebin -pa "$CONSOLIDATED_DIR" \
         -hidden -noshell \
         -boot start_clean -boot_var ERTS_LIB_DIR "$ERTS_LIB_DIR" \
         -kernel net_ticktime "$TICKTIME" \
@@ -135,10 +137,10 @@ relx_rem_sh() {
 
 # Generate a random id
 relx_gen_id() {
-    od -X /dev/urandom | head -n1 | cut -d ' ' -f2
+    od -t x4 /dev/urandom | head -n1 | cut -d ' ' -f2
 }
 
-# Control a node
+# Control a node - set PEERNAME to control a peer node
 relx_nodetool() {
     command="$1"; shift
     "$BINDIR/escript" "$ROOTDIR/bin/nodetool" "$NAME_TYPE" "$NAME" \
@@ -263,7 +265,6 @@ generate_sys_config() {
             if [ ! -f "$__conform" ]; then
                 __conform="$ROOTDIR/bin/conform"
             fi
-
             result="$("$BINDIR/escript" "$__conform" --conf "$__conform_file" --schema "$__schema_file" --config "$RELEASE_CONFIG_DIR/sys.config" --output-dir "$GENERATED_CONFIG_DIR")"
             exit_status="$?"
             if [ "$exit_status" -ne 0 ]; then
@@ -277,6 +278,12 @@ generate_sys_config() {
             echo "$__conform_file not found in $RELEASE_CONFIG_DIR"
             exit 1
         fi
+    else
+        cp $RELEASE_SYS_CONFIG "$GENERATED_CONFIG_DIR/sys.config"
+    fi
+    if [ ! -f "$VMARGS_PATH" ]; then
+        cp "$RELEASE_CONFIG_DIR/vm.args" "$GENERATED_CONFIG_DIR/vm.args"
+        VMARGS_PATH="$GENERATED_CONFIG_DIR/vm.args"
     fi
 }
 
@@ -289,11 +296,14 @@ if [ -z "$RELEASE_CONFIG_DIR" ]; then
 fi
 
 SYS_CONFIG="$GENERATED_CONFIG_DIR/sys.config"
-VMARGS_PATH="$GENERATED_CONFIG_DIR/vm.args"
+RELEASE_SYS_CONFIG="$RELEASE_CONFIG_DIR/sys.config"
+if [ -z "$VMARGS_PATH" ]; then
+  VMARGS_PATH="$GENERATED_CONFIG_DIR/vm.args"
+fi
 
 # If first run, take dafault sys.config and vm.args
 if [ ! -f "$SYS_CONFIG" ]; then
-    cp "$RELEASE_CONFIG_DIR/sys.config" "$GENERATED_CONFIG_DIR/sys.config"
+    cp $RELEASE_SYS_CONFIG "$GENERATED_CONFIG_DIR/sys.config"
 fi
 if [ ! -f "$VMARGS_PATH" ]; then
     cp "$RELEASE_CONFIG_DIR/vm.args" "$GENERATED_CONFIG_DIR/vm.args"
@@ -351,6 +361,7 @@ export EMU="beam"
 export PROGNAME="erl"
 export LD_LIBRARY_PATH="$ERTS_DIR/lib:$LD_LIBRARY_PATH"
 ERTS_LIB_DIR="$ERTS_DIR/../lib"
+CONSOLIDATED_DIR="$ROOTDIR/lib/${REL_NAME}-${REL_VSN}/consolidated"
 
 cd "$ROOTDIR"
 
@@ -373,7 +384,7 @@ case "$1" in
         case "$1" in
             start)
                 shift
-                START_OPTION="console"
+                START_OPTION="foreground"
                 HEART_OPTION="start"
                 ;;
             start_boot)
@@ -483,7 +494,17 @@ case "$1" in
         fi
         ;;
 
+    pingpeer)
+        PEERNAME=$2 relx_nodetool "ping"
+        exit_status=$?
+        if [ "$exit_status" -ne 0 ]; then
+            exit $exit_status
+        fi
+        ;;
+
     escript)
+        # Make sure the config is generated first
+        generate_config
         ## Run an escript under the node's environment
         relx_escript $@
         exit_status=$?
@@ -504,7 +525,8 @@ case "$1" in
         if [ -z "$4" ]; then
             relx_nodetool "rpcterms" "$2" "$3"
         else
-            relx_nodetool "rpcterms" "$2" "$3" "$4"
+            args="${@:4}"
+            relx_nodetool "rpcterms" "$2" "$3" "$args"
         fi
         exit_status="$?"
         if [ "$exit_status" -ne 0 ]; then
@@ -557,7 +579,7 @@ case "$1" in
         fi
 
         # We have to unpack the release first in order to make sure the configuration
-        # is properly updated
+        # is properly updated. This also destroys the .tar.gz package (release_handler does)
         "$BINDIR/escript" "$ROOTDIR/bin/install_upgrade.escript" \
              "unpack" "$REL_NAME" "$NAME_TYPE" "$NAME" "$COOKIE" "$2"
 
@@ -645,8 +667,10 @@ case "$1" in
         # .boot file typically just $REL_NAME (ie, the app name)
         # however, for debugging, sometimes start_clean.boot is useful.
         # For e.g. 'setup', one may even want to name another boot script.
+        __console_flags=""
         case "$1" in
             console)
+                __console_flags="-mode embedded"
                 if [ -f "$REL_DIR/$REL_NAME.boot" ]; then
                     BOOTFILE="$REL_DIR/$REL_NAME"
                 else
@@ -674,11 +698,13 @@ case "$1" in
 
         # Build an array of arguments to pass to exec later on
         # Build it here because this command will be used for logging.
-        set -- "$BINDIR/erlexec" -boot "$BOOTFILE" \
+        set -- "$BINDIR/erlexec" \
+            -boot "$BOOTFILE" -config "$SYS_CONFIG" \
             -boot_var ERTS_LIB_DIR "$ERTS_LIB_DIR" \
-            -env ERL_LIBS "$REL_LIB_DIR" -config "$SYS_CONFIG" \
-            -pa "$REL_LIB_DIR/consolidated" \
+            -env ERL_LIBS "$REL_LIB_DIR" \
+            -pa "$CONSOLIDATED_DIR" \
             -args_file "$VMARGS_PATH" \
+            ${__console_flags} \
             ${ERL_OPTS} \
             ${CONFORM_OPTS} \
             -user Elixir.IEx.CLI -extra --no-halt +iex
@@ -723,8 +749,8 @@ case "$1" in
         set -- "$BINDIR/erlexec" $FOREGROUNDOPTIONS \
             -boot "$REL_DIR/$BOOTFILE" -mode embedded -config "$SYS_CONFIG" \
             -boot_var ERTS_LIB_DIR "$ERTS_LIB_DIR" \
-            -pa "$REL_LIB_DIR/consolidated" \
             -env ERL_LIBS "$REL_LIB_DIR" \
+            -pa "$CONSOLIDATED_DIR" \
             ${ERL_OPTS} \
             ${CONFORM_OPTS} \
             -args_file "$VMARGS_PATH"
@@ -736,8 +762,42 @@ case "$1" in
         # Start the VM
         exec "$@" -- ${1+$ARGS}
         ;;
+
+    command)
+        # Make sure the config is generated first
+        generate_config
+
+        # Execute as command-line utility
+        #
+        # Like the escript command, this does not start the OTP application.
+        # If your command depends on a running OTP application,
+        # use
+        #
+        #     {:ok, _} = Application.ensure_all_started(:your_app)
+
+        shift
+        MODULE="$1"; shift
+        FUNCTION="$1"; shift
+
+        # Save extra arguments
+        ARGS="$@"
+
+        # Build arguments for erlexec
+        set -- "$ERL_OPTS"
+        [ "$SYS_CONFIG" ] && set -- "$@" -config "$SYS_CONFIG"
+        [ "$VMARGS_PATH" ] && set -- "$@" -args_file "$VMARGS_PATH"
+        set -- "$@" -boot_var ERTS_LIB_DIR "$ERTS_LIB_DIR"
+        set -- "$@" -noshell
+        set -- "$@" -boot $REL_DIR/start_clean
+        set -- "$@" -s "$MODULE" "$FUNCTION"
+
+        # Boot the release
+        $BINDIR/erlexec $@ -extra $ARGS
+        exit "$?"
+        ;;
+
     *)
-        echo "Usage: $REL_NAME {start|start_boot <file>|foreground|stop|restart|reboot|ping|rpc <m> <f> [<a>]|console|console_clean|console_boot <file>|attach|remote_console|upgrade|escript}"
+        echo "Usage: $REL_NAME {start|start_boot <file>|foreground|stop|restart|reboot|ping|rpc <m> <f> [<a>]|console|console_clean|console_boot <file>|attach|remote_console|upgrade|escript|command <m> <f> <args>}"
         exit 1
         ;;
 esac

@@ -17,17 +17,23 @@ defmodule Mix.Tasks.Release do
       # Set the verbosity level
       mix release --verbosity=[silent|quiet|normal|verbose]
 
+      # Do not ask for confirmation to skip missing applications warning
+      mix release --no-confirm-missing
+
   You may pass any number of arguments as needed. Make sure you pass arguments
   using `--key=value`, not `--key value`, as the args may be interpreted incorrectly
   otherwise.
 
   """
-  @shortdoc "Build a release for the current mix application."
+  @shortdoc "Build a release for the current mix application"
 
   use    Mix.Task
+  import ExUnit.CaptureIO
   import ReleaseManager.Utils
   alias  ReleaseManager.Utils
+  alias  ReleaseManager.Utils.Logger
   alias  ReleaseManager.Config
+  alias  ReleaseManager.Deps
 
   @_RELXCONF    "relx.config"
   @_BOOT_FILE   "boot"
@@ -43,6 +49,8 @@ defmodule Mix.Tasks.Release do
   @_LIB_DIRS    "{{{LIB_DIRS}}}"
 
   def run(args) do
+    Mix.Project.compile(args)
+
     if Mix.Project.umbrella? do
       config = [umbrella?: true]
       for %Mix.Dep{app: app, opts: opts} <- Mix.Dep.Umbrella.loaded do
@@ -58,10 +66,10 @@ defmodule Mix.Tasks.Release do
     Mix.Tasks.Release.Clean.do_cleanup(:build)
     # Collect release configuration
     config = parse_args(args)
-    info "Building release with MIX_ENV=#{config.env}."
+    Logger.notice "Building release with MIX_ENV=#{config.env}."
     # Begin release pipeline
     config
-    |> build_project
+    |> check_applications(args)
     |> generate_relx_config
     |> generate_sys_config
     |> generate_vm_args
@@ -74,30 +82,37 @@ defmodule Mix.Tasks.Release do
     |> update_release_package
     |> execute_package_hooks
 
-    info "The release for #{config.name}-#{config.version} is ready!"
-    info "You can boot a console running your release with `$ rel/#{config.name}/bin/#{config.name} console`"
+    Logger.info "The release for #{config.name}-#{config.version} is ready!"
+    Logger.info "You can boot a console running your release with `$ rel/#{config.name}/bin/#{config.name} console`"
   end
 
-  defp build_project(%Config{verbosity: verbosity, env: env} = config) do
-    # Fetch deps, and compile, using the prepared Elixir binaries
-    cond do
-      verbosity == :verbose ->
-        mix "deps.get",     env, :verbose
-        mix "compile",      env, :verbose
-      true ->
-        mix "deps.get",     env
-        mix "compile",      env
+  defp check_applications(%Config{} = config, args) do
+    case Deps.print_missing_applications(ignore: [:exrm]) do
+      ""     -> config
+      output ->
+        IO.puts IO.ANSI.yellow
+        IO.puts "You have dependencies (direct/transitive) which are not in :applications!"
+        IO.puts "The following apps should be added to :applications in mix.exs:\n#{output}#{IO.ANSI.reset}\n"
+        case "--no-confirm-missing" in args do
+          true  ->
+            config
+          false ->
+            msg    = IO.ANSI.yellow <> "Continue anyway? Your release may not work as expected if these dependencies are required!"
+            answer = IO.gets(msg <> " [Yn]: ") |> String.rstrip(?\n)
+            IO.puts IO.ANSI.reset
+            case answer =~ ~r/^(Y(es)?)?$/i do
+              true  -> config
+              false -> abort!
+            end
+        end
     end
-    # Continue...
-    config
   end
 
-  defp generate_relx_config(%Config{name: name, version: version, env: env} = config) do
-    debug "Generating relx configuration..."
+  defp generate_relx_config(%Config{name: name, version: version} = config) do
+    Logger.debug "Generating relx configuration..."
     # Get paths
     rel_def  = rel_file_source_path @_RELEASE_DEF
     source   = rel_source_path @_RELXCONF
-    dest     = rel_file_dest_path @_RELXCONF
     # Get relx.config template contents
     relx_config = source |> File.read!
     # Get release definition template contents
@@ -112,13 +127,7 @@ defmodule Mix.Tasks.Release do
       _  -> %{config | :upgrade? => true}
     end
     elixir_paths = get_elixir_lib_paths |> Enum.map(&String.to_char_list/1)
-    lib_dirs = case Mix.Project.config |> Keyword.get(:umbrella?, false) do
-      true ->
-        [ '#{"_build/#{env}" |> Path.expand}',
-          '#{Mix.Project.config |> Keyword.get(:deps_path) |> Path.expand}' | elixir_paths ]
-      _ ->
-        [ '#{"_build/#{env}" |> Path.expand}' | elixir_paths ]
-    end
+    lib_dirs = [ '#{Path.join(Mix.Project.build_path, "lib")}', '#{Mix.Project.deps_path}' | elixir_paths ]
     # Build release configuration
     relx_config = relx_config
       |> String.replace(@_RELEASES, releases)
@@ -131,7 +140,7 @@ defmodule Mix.Tasks.Release do
     user_config_path = rel_dest_path @_RELXCONF
     merged = case user_config_path |> File.exists? do
       true  ->
-        debug "Merging custom relx configuration from #{user_config_path |> Path.relative_to_cwd}..."
+        Logger.debug "Merging custom relx configuration from #{user_config_path |> Path.relative_to_cwd}..."
         case Utils.read_terms(user_config_path) do
           []                                      -> relx_config
           [{_, _}|_] = user_config                -> Utils.merge(relx_config, user_config)
@@ -142,13 +151,7 @@ defmodule Mix.Tasks.Release do
         relx_config
     end
     # Save relx config for use later
-    config = %{config | :relx_config => merged}
-    # Ensure destination base path exists
-    dest |> Path.dirname |> File.mkdir_p!
-    # Persist relx.config
-    Utils.write_terms(dest, merged)
-    # Return the project config after we're done
-    config
+    %{config | :relx_config => merged}
   end
 
   defp generate_sys_config(%Config{env: env} = config) do
@@ -156,7 +159,7 @@ defmodule Mix.Tasks.Release do
     user_sysconfig    = rel_dest_path @_SYSCONFIG
     dest              = rel_file_dest_path   @_SYSCONFIG
 
-    debug "Generating sys.config..."
+    Logger.debug "Generating sys.config..."
     # Read in current project config
     project_conf = load_config(env)
     # Merge project config with either the user-provided config, or the default sys.config we provide.
@@ -164,7 +167,7 @@ defmodule Mix.Tasks.Release do
     # default sys.config is used, the project config will take precedence instead.
     merged = case user_sysconfig |> File.exists? do
       true ->
-        debug "Merging custom sys.config from #{user_sysconfig |> Path.relative_to_cwd}..."
+        Logger.debug "Merging custom sys.config from #{user_sysconfig |> Path.relative_to_cwd}..."
         # User-provided
         case user_sysconfig |> Utils.read_terms do
           []                                  -> project_conf
@@ -184,23 +187,25 @@ defmodule Mix.Tasks.Release do
     config
   end
 
-  defp generate_vm_args(%Config{version: version} = config) do
-    vmargs_path = Utils.rel_dest_path("vm.args")
-    if vmargs_path |> File.exists? do
-      debug "Generating vm.args..."
-      relx_config_path = Utils.rel_file_dest_path("relx.config")
-      # Read in relx.config
-      relx_config = relx_config_path |> Utils.read_terms
-      # Update configuration to add new overlay for vm.args
-      overlays = [overlay: [
-        {:copy, vmargs_path |> String.to_char_list, 'releases/#{version}/vm.args'}
-      ]]
-      updated = Utils.merge(relx_config, overlays)
-      # Persist relx.config
-      Utils.write_terms(relx_config_path, updated)
+  defp generate_vm_args(%Config{version: version, relx_config: relx_config} = config) do
+    Logger.debug "Generating vm.args..."
+    vmargs_path = rel_dest_path(@_VMARGS)
+    vmargs_path = case File.exists?(vmargs_path) do
+      false ->
+        src_path  = rel_file_source_path(@_VMARGS)
+        dest_path = rel_file_dest_path(@_VMARGS)
+        contents  = File.read!(src_path) |> String.replace(@_NAME, config.name)
+        File.write!(dest_path, contents)
+        dest_path
+      true ->
+        vmargs_path
     end
-    # Continue..
-    config
+    overlays = [overlay: [
+      {:copy, String.to_char_list(vmargs_path), 'releases/#{version}/vm.args'}
+    ]]
+    # Update configuration to add new overlay for vm.args
+    updated = Utils.merge(relx_config, overlays)
+    %{config | :relx_config => updated}
   end
 
   defp generate_boot_script(%Config{name: name, version: version, erl: erl_opts} = config) do
@@ -214,7 +219,7 @@ defmodule Mix.Tasks.Release do
     shim_dest    = rel_file_dest_path "boot_shim"
     winshim_dest = rel_file_dest_path "boot_shim.bat"
 
-    debug "Generating boot script..."
+    Logger.debug "Generating boot script..."
 
     [{boot, dest}, {winboot, windest}, {shim, shim_dest}, {winshim, winshim_dest}]
     |> Enum.each(fn {infile, outfile} ->
@@ -233,18 +238,23 @@ defmodule Mix.Tasks.Release do
   end
 
   defp execute_before_hooks(%Config{} = config) do
+    # Just in case there are plugins which expect relx.config to already
+    # be persisted, we'll persist it before any are run, and again after each plugin runs
+    Utils.write_terms(relx_config_path, config.relx_config)
     plugins = ReleaseManager.Plugin.load_all
     Enum.reduce plugins, config, fn plugin, conf ->
       try do
         # Handle the case where a child plugin does not return the configuration
-        case plugin.before_release(conf) do
+        config = case plugin.before_release(conf) do
           %Config{} = result -> result
           _                  -> conf
         end
+        Utils.write_terms(relx_config_path, config.relx_config)
+        config
       rescue
         exception ->
           stacktrace = System.stacktrace
-          error "Failed to execute before_release hook for #{plugin}!"
+          Logger.error "Failed to execute before_release hook for #{plugin}!"
           reraise exception, stacktrace
       end
     end
@@ -262,7 +272,7 @@ defmodule Mix.Tasks.Release do
       rescue
         exception ->
           stacktrace = System.stacktrace
-          error "Failed to execute after_release hook for #{plugin}!"
+          Logger.error "Failed to execute after_release hook for #{plugin}!"
           reraise exception, stacktrace
       end
     end
@@ -280,14 +290,16 @@ defmodule Mix.Tasks.Release do
       rescue
         exception ->
           stacktrace = System.stacktrace
-          error "Failed to execute after_package hook for #{plugin}!"
+          Logger.error "Failed to execute after_package hook for #{plugin}!"
           reraise exception, stacktrace
       end
     end
   end
 
   defp do_release(%Config{name: name, version: version, verbosity: verbosity, upgrade?: upgrade?, dev: dev_mode?, env: env} = config) do
-    debug "Generating release..."
+    Logger.debug "Generating release..."
+    # Persist relx.config one last time in case it was updated by a plugin
+    Utils.write_terms(relx_config_path, config.relx_config)
     # If this is an upgrade release, generate an appup
     if upgrade? do
       # Change mix env for appup generation
@@ -296,7 +308,7 @@ defmodule Mix.Tasks.Release do
         app      = name |> String.to_atom
         v1       = get_last_release(name)
         v1_path  = rel_dest_path [name, "lib", "#{name}-#{v1}"]
-        v2_path  = Mix.Project.config |> Mix.Project.compile_path |> String.replace("/ebin", "")
+        v2_path  = Mix.Project.compile_path |> String.replace("/ebin", "")
         own_path = rel_dest_path "#{name}.appup"
         # Look for user's own .appup file before generating one
         case own_path |> File.exists? do
@@ -304,18 +316,18 @@ defmodule Mix.Tasks.Release do
             # Copy it to ebin
             case File.cp(own_path, Path.join([v2_path, "/ebin", "#{name}.appup"])) do
               :ok ->
-                info "Using custom .appup located in rel/#{name}.appup"
+                Logger.info "Using custom .appup located in rel/#{name}.appup"
               {:error, reason} ->
-                error "Unable to copy custom .appup file: #{reason}"
+                Logger.error "Unable to copy custom .appup file: #{reason}"
                 abort!
             end
           _ ->
             # No custom .appup found, proceed with autogeneration
             case ReleaseManager.Appups.make(app, v1, version, v1_path, v2_path) do
               {:ok, _}         ->
-                info "Generated .appup for #{name} #{v1} -> #{version}"
+                Logger.info "Generated .appup for #{name} #{v1} -> #{version}"
               {:error, reason} ->
-                error "Appup generation failed with #{reason}"
+                Logger.error "Appup generation failed with #{reason}"
                 abort!
             end
         end
@@ -323,26 +335,34 @@ defmodule Mix.Tasks.Release do
     end
     # Do release
     try do
-      case relx name, version, verbosity, upgrade?, dev_mode? do
+      logs = capture_io(:stdio, fn ->
+        result = relx(name, version, :verbose, upgrade?, dev_mode?)
+        send(self(), result)
+      end)
+      receive do
         :ok ->
+          if verbosity == :verbose do
+            IO.puts(logs)
+          end
           # Clean up template files
           Mix.Tasks.Release.Clean.do_cleanup(:relfiles)
           # Continue..
           config
         {:error, message} ->
-          error message
+          IO.puts(logs)
+          Logger.error "ERROR: #{inspect message}"
           abort!
       end
     catch
       err ->
-        error "#{IO.inspect err}"
-        error "Failed to build release package! Try running with `--verbosity=verbose` to see debugging info!"
+        Logger.error "#{IO.inspect err}"
+        Logger.error "Failed to build release package! Try running with `--verbosity=verbose` to see debugging info!"
         abort!
     end
   end
 
   defp generate_nodetool(%Config{name: name} = config) do
-    debug "Generating nodetool..."
+    Logger.debug "Generating nodetool..."
     nodetool = rel_file_source_path @_NODETOOL
     dest     = rel_dest_path [name, "bin", @_NODETOOL]
     # Copy
@@ -362,7 +382,7 @@ defmodule Mix.Tasks.Release do
 
   defp update_release_package(%Config{dev: true} = config), do: config
   defp update_release_package(%Config{name: name, version: version, relx_config: relx_config} = config) do
-    debug "Packaging release..."
+    Logger.debug "Packaging release..."
     # Delete original release package
     tarball = rel_dest_path [name, "#{name}-#{version}.tar.gz"]
     File.rm! tarball
@@ -398,18 +418,11 @@ defmodule Mix.Tasks.Release do
     # Create archive
     release_tarball = rel_dest_path([name, "releases", version, "#{name}.tar.gz"])
     :ok = :erl_tar.create(
-      '#{tarball}.tmp',
+      '#{tarball}',
       file_list,
       [:compressed]
     )
-    # In order to provide upgrade/downgrade functionality, the archive needs to contain itself
-    :ok = :erl_tar.create(
-      '#{tarball}',
-      [{'#{Path.join(["releases", version, "#{name}.tar.gz"])}', '#{tarball}.tmp'} | file_list],
-      [:compressed]
-    )
     # Clean up
-    File.rm_rf! "#{tarball}.tmp"
     File.cp! tarball, release_tarball
     File.rm_rf! tarball
 
@@ -427,7 +440,9 @@ defmodule Mix.Tasks.Release do
     Enum.reduce args, defaults, fn arg, config ->
       case arg do
         {:verbosity, verbosity} ->
-          %{config | :verbosity => String.to_atom(verbosity)}
+          verbosity = String.to_atom(verbosity)
+          Logger.configure(verbosity)
+          %{config | :verbosity => verbosity}
         {key, value} ->
           Map.put(config, key, value)
       end
@@ -459,6 +474,13 @@ defmodule Mix.Tasks.Release do
             end
         end
     end
+  end
+
+  def relx_config_path do
+    path = rel_file_dest_path @_RELXCONF
+    # Ensure destination base path exists
+    path |> Path.dirname |> File.mkdir_p!
+    path
   end
 
 end

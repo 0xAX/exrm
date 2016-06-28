@@ -3,36 +3,50 @@ defmodule ReleaseManager.Mixfile do
 
   def project do
     [ app: :exrm,
-      version: "0.19.6",
+      version: "1.0.5",
       elixir: "~> 1.0",
       description: description,
       package: package,
       deps: deps,
+      docs: docs,
       test_coverage: [tool: Coverex.Task, coveralls: true]]
   end
 
-  def application, do: []
+  def application, do: [
+    applications: [:logger, :relx]
+  ]
 
   def deps do
-    [{:conform, github: "xerions/conform", branch: "master"},
-     {:relx, "~> 3.5.0" },
-     {:earmark, "~> 0.1", only: :dev},
-     {:ex_doc, "~> 0.9", only: :dev},
-     {:coverex, "~> 1.4.1", only: :test}]
+    [{:relx, "~> 3.5" },
+     {:earmark, "~> 0.2", only: :dev},
+     {:ex_doc, "~> 0.11", only: :dev},
+     {:coverex, "~> 1.4", only: :test}]
   end
 
   defp description do
     """
-    Exrm, or Elixir Release Manager, provides mix tasks for building, 
+    Exrm, or Elixir Release Manager, provides mix tasks for building,
     upgrading, and controlling release packages for your application.
     """
   end
 
   defp package do
     [ files: ["lib", "priv", "mix.exs", "README.md", "LICENSE"],
-      contributors: ["Paul Schoenfelder"],
+      maintainers: ["Paul Schoenfelder"],
       licenses: ["MIT"],
       links: %{ "GitHub": "https://github.com/bitwalker/exrm" } ]
+  end
+
+  defp docs do
+    [main: "getting-started",
+     extras: [
+        "docs/Getting Started.md",
+        "docs/Release Configuration.md",
+        "docs/Deployment.md",
+        "docs/Upgrades and Downgrades.md",
+        "docs/Common Issues.md",
+        "docs/Examples.md"
+    ]]
   end
 
 end
